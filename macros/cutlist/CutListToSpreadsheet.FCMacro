@@ -1,0 +1,367 @@
+# -*- coding: utf-8 -*-
+"""
+FreeCAD Macro: CutList to Spreadsheet (FINAL)
+
+- Recursive traversal (Groups, Links, Bodies)
+- Correct Make Link qty handling
+- Parts = Bodies and Link-to-Body instances
+- Aggregation by (Length, Width, Material)
+- Smart label merge: "Base Left/Middle/Right"
+- Enabled column ALWAYS true
+- Final confirmation message shown to user
+"""
+
+import FreeCAD as App
+import FreeCADGui as Gui
+from collections import defaultdict
+import os
+import csv
+from datetime import datetime
+
+
+try:
+    from PySide2 import QtWidgets
+except Exception:
+    from PySide import QtGui as QtWidgets
+
+SPREADSHEET_NAME = "CutList"
+DECIMALS = 2
+
+# -----------------------------
+# Type helpers
+# -----------------------------
+def is_body(obj):
+    return obj and obj.TypeId == "PartDesign::Body"
+
+def is_link(obj):
+    return obj and obj.TypeId == "App::Link"
+
+def link_target(obj):
+    return getattr(obj, "LinkedObject", None) if is_link(obj) else None
+
+def is_container(obj):
+    if not obj or is_body(obj):
+        return False
+    if is_link(obj):
+        tgt = link_target(obj)
+        return bool(tgt and hasattr(tgt, "Group") and tgt.Group and not is_body(tgt))
+    return bool(hasattr(obj, "Group") and obj.Group)
+
+def children_of(obj):
+    if not obj:
+        return []
+    if is_link(obj):
+        tgt = link_target(obj)
+        if tgt and hasattr(tgt, "Group") and tgt.Group and not is_body(tgt):
+            return list(tgt.Group)
+        return []
+    if hasattr(obj, "Group") and obj.Group:
+        return list(obj.Group)
+    return []
+
+# -----------------------------
+# Geometry helpers
+# -----------------------------
+def get_bbox_dims_mm(obj):
+    def bbox_from(o):
+        if not o or not hasattr(o, "Shape"):
+            return None
+        try:
+            sh = o.Shape
+            if sh is None or sh.isNull():
+                return None
+            bb = sh.BoundBox
+            dx, dy, dz = float(bb.XLength), float(bb.YLength), float(bb.ZLength)
+            if dx <= 1e-9 or dy <= 1e-9 or dz <= 1e-9:
+                return None
+            return (dx, dy, dz)
+        except Exception:
+            return None
+
+    dims = bbox_from(obj)
+    if dims:
+        return dims
+    if is_link(obj) and link_target(obj):
+        return bbox_from(link_target(obj))
+    return None
+
+def normalize_dims(dx, dy, dz):
+    dims = sorted([dx, dy, dz])
+    return dims[2], dims[1], dims[0]  # Length, Width, Material
+
+def r(v):
+    return round(float(v), DECIMALS)
+
+# -----------------------------
+# Selection
+# -----------------------------
+def get_selected_objects():
+    selected = list(Gui.Selection.getSelection())
+    if not selected:
+        sel_ex = Gui.Selection.getSelectionEx()
+        selected = [sx.Object for sx in sel_ex if getattr(sx, "Object", None)]
+    if not selected:
+        raise RuntimeError("Selection is empty.")
+    return selected
+
+# -----------------------------
+# Label merging
+# -----------------------------
+def tokenize(label):
+    s = str(label).strip().replace("-", " - ")
+    return [t for t in s.split() if t]
+
+def detokenize(tokens):
+    return " ".join(tokens).replace(" - ", " - ").strip()
+
+def common_prefix_tokens(token_lists):
+    if not token_lists:
+        return []
+    min_len = min(len(x) for x in token_lists)
+    prefix = []
+    for i in range(min_len):
+        tok = token_lists[0][i]
+        if all(x[i] == tok for x in token_lists[1:]):
+            prefix.append(tok)
+        else:
+            break
+    return prefix
+
+def merged_label_from_labels(labels):
+    labels = [l for l in labels if str(l).strip()]
+    if not labels:
+        return "Unnamed"
+
+    # If all labels identical -> just return that label
+    first = labels[0]
+    if all(l == first for l in labels):
+        return first
+
+    toks = [tokenize(l) for l in labels]
+    prefix = common_prefix_tokens(toks)
+
+    # Build remainders, dedupe while preserving order
+    uniq_remainders = []
+    seen = set()
+
+    for t in toks:
+        rem = t[len(prefix):]
+        rem_s = detokenize(rem).strip()
+        if not rem_s:
+            continue
+        if rem_s not in seen:
+            seen.add(rem_s)
+            uniq_remainders.append(rem_s)
+
+    prefix_s = detokenize(prefix).strip()
+
+    if prefix_s and uniq_remainders:
+        return f"{prefix_s} {'/'.join(uniq_remainders)}".strip()
+
+    # No common prefix: dedupe full labels and join
+    uniq_labels = []
+    seen2 = set()
+    for l in labels:
+        if l not in seen2:
+            seen2.add(l)
+            uniq_labels.append(l)
+
+    return "/".join(uniq_labels)
+
+# -----------------------------
+# Traversal
+# -----------------------------
+def collect_part_instances(selected_roots):
+    visited = set()
+    parts = []
+
+    def walk(obj, path_key):
+        if not obj:
+            return
+        my_key = path_key + "/" + obj.Name
+        if my_key in visited:
+            return
+        visited.add(my_key)
+
+        if is_link(obj):
+            tgt = link_target(obj)
+            if tgt and is_body(tgt):
+                parts.append((obj, obj.Label))
+                return
+
+        if is_body(obj):
+            parts.append((obj, obj.Label))
+            return
+
+        if is_container(obj):
+            for c in children_of(obj):
+                walk(c, my_key)
+
+    for root in selected_roots:
+        walk(root, "ROOT")
+
+    return parts
+
+# -----------------------------
+# Spreadsheet helpers
+# -----------------------------
+def ensure_spreadsheet(doc, name):
+    for o in doc.Objects:
+        if o.TypeId == "Spreadsheet::Sheet" and o.Name == name:
+            return o
+    return doc.addObject("Spreadsheet::Sheet", name)
+
+def write_sheet(ss, rows):
+    headers = ["Length", "Width", "Qty", "Material", "Label", "Enabled"]
+
+    # 🔥 IMPORTANT: wipe previous content first
+    clear_sheet(ss, max_rows=max(200, len(rows) + 50), max_cols=len(headers))
+
+    for c, h in enumerate(headers, start=1):
+        ss.set(f"{chr(64+c)}1", h)
+
+    for i, rr in enumerate(rows, start=2):
+        ss.set(f"A{i}", str(rr["Length"]))
+        ss.set(f"B{i}", str(rr["Width"]))
+        ss.set(f"C{i}", str(rr["Qty"]))
+        ss.set(f"D{i}", str(rr["Material"]))
+        ss.set(f"E{i}", rr["Label"])
+        ss.set(f"F{i}", "true")
+
+    try:
+        ss.setColumnWidth("A", 120)
+        ss.setColumnWidth("B", 120)
+        ss.setColumnWidth("C", 70)
+        ss.setColumnWidth("D", 120)
+        ss.setColumnWidth("E", 260)
+        ss.setColumnWidth("F", 90)
+    except Exception:
+        pass
+
+def clear_sheet(ss, max_rows=500, max_cols=6):
+    """
+    Clears a rectangular area of the spreadsheet to avoid stale rows.
+    """
+    for row in range(1, max_rows + 1):
+        for col in range(1, max_cols + 1):
+            cell = f"{chr(64 + col)}{row}"
+            try:
+                ss.set(cell, "")
+            except Exception:
+                pass
+
+def export_rows_to_csv(rows, parent=None):
+    """
+    Ask user for a folder and export cut list rows to CSV.
+    """
+    # Ask for folder
+    folder = QtWidgets.QFileDialog.getExistingDirectory(
+        parent,
+        "Select folder to export CSV"
+    )
+
+    if not folder:
+        return  # user cancelled
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"cut_list_{timestamp}.csv"
+    path = os.path.join(folder, filename)
+
+    headers = ["Length", "Width", "Qty", "Material", "Label", "Enabled"]
+
+    try:
+        with open(path, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for r in rows:
+                writer.writerow([
+                    r["Length"],
+                    r["Width"],
+                    r["Qty"],
+                    r["Material"],
+                    r["Label"],
+                    "true"
+                ])
+    except Exception as e:
+        QtWidgets.QMessageBox.critical(
+            parent,
+            "CSV Export Failed",
+            f"Could not export CSV:\n{e}"
+        )
+        return
+
+    QtWidgets.QMessageBox.information(
+        parent,
+        "CSV Exported",
+        f"CSV file successfully exported:\n\n{path}"
+    )
+
+
+# -----------------------------
+# Main
+# -----------------------------
+doc = App.ActiveDocument
+if not doc:
+    raise RuntimeError("No active document.")
+
+selected_roots = get_selected_objects()
+instances = collect_part_instances(selected_roots)
+
+agg = defaultdict(lambda: {"qty": 0, "labels": []})
+
+for inst_obj, inst_label in instances:
+    dims = get_bbox_dims_mm(inst_obj)
+    if not dims:
+        continue
+    L, W, T = normalize_dims(*dims)
+    key = (r(L), r(W), r(T))
+    agg[key]["qty"] += 1
+    agg[key]["labels"].append(inst_label)
+
+rows = []
+for (L, W, T), data in agg.items():
+    rows.append({
+        "Length": L,
+        "Width": W,
+        "Qty": data["qty"],
+        "Material": T,
+        "Label": merged_label_from_labels(data["labels"]),
+        "Enabled": True,
+    })
+
+rows.sort(key=lambda x: (x["Material"], x["Length"], x["Width"], x["Label"]))
+
+ss = ensure_spreadsheet(doc, SPREADSHEET_NAME)
+write_sheet(ss, rows)
+doc.recompute()
+
+# -----------------------------
+# Final confirmation
+# -----------------------------
+main_window = Gui.getMainWindow()
+
+msg = (
+    f"Cut list generated successfully.\n\n"
+    f"Spreadsheet: '{SPREADSHEET_NAME}'\n"
+    f"Rows: {len(rows)}\n\n"
+    f"Do you want to export it to CSV?"
+)
+
+reply = QtWidgets.QMessageBox.question(
+    main_window,
+    "Cut List Generated",
+    msg,
+    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+    QtWidgets.QMessageBox.No
+)
+
+Gui.getMainWindow().statusBar().showMessage(
+    f"Cut list generated ({len(rows)} rows)", 8000
+)
+
+App.Console.PrintMessage(
+    f"Cut list generated. Rows: {len(rows)}\n"
+)
+
+if reply == QtWidgets.QMessageBox.Yes:
+    export_rows_to_csv(rows, parent=main_window)
