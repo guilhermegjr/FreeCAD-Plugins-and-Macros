@@ -31,21 +31,35 @@ and writes the result to a Spreadsheet. Optionally, it can export the result to 
 | Label  | Human-friendly merged label |
 | Enabled | Always `true` |
 
-## How to use
+## Using the CSV with Cut List Optimizer
 
-1. Open your FreeCAD document
-2. Select an assembly, group, or subtree in the **Model Tree**
-3. Run the macro
-4. The spreadsheet **CutList** will be created or updated
-5. You will be asked if you want to export the result to CSV
+The generated CSV file can be **directly imported** into  
+👉 https://www.cutlistoptimizer.com/
 
-## Notes
+This allows you to visually optimize how boards or panels should be cut
+to minimize waste.
 
-- The macro is safe to re-run multiple times
-- Old spreadsheet data is always wiped
-- No Pad/Sketch names are ever used as labels
+### How to use it
 
-## Tested with
+1. Run the macro and choose **Export to CSV**
+2. Open https://www.cutlistoptimizer.com/
+3. Select **Import CSV**
+4. Map the fields as follows:
 
-- FreeCAD 0.21+
-- macOS (Apple Silicon & Intel)
+| Cut List Optimizer Field | CSV Column |
+|------------------------|------------|
+| Length                 | Length     |
+| Width                  | Width      |
+| Quantity               | Qty        |
+| Thickness (optional)   | Material   |
+| Label / Part name      | Label      |
+
+5. Define your stock sheet sizes (e.g. plywood sheets, boards)
+6. Generate the cutting layout
+
+### Notes
+
+- Units are exported in **millimeters**
+- Thickness (`Material`) is included for reference and filtering
+- The `Enabled` column can be ignored by the optimizer
+- Labels like `Base Left/Middle/Right` help identify parts visually
